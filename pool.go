@@ -14,6 +14,11 @@ type Task func()
 type Pool struct {
 	capacity int    		// workerpool 大小
 
+	preAlloc bool			// 是否在创建 pool 的时候就预创建workers，默认值: false
+	// 当pool 满的情况下，新的 Schedule 调用是否阻塞当前goroutine，默认值: true
+	// 如果 block = false，则 Schedule 返回 ErrNoWorkerAvailInPool
+	block bool
+
 	active chan struct{}	// active channel
 	tasks chan Task
 
@@ -21,7 +26,7 @@ type Pool struct {
 	quit chan struct{}		// 用于通知各个worker退出的信号channel
 }
 
-func New(capacity int) *Pool {
+func New(capacity int, opts ...Option) *Pool {
 	if capacity < 0 {
 		capacity = defaultCapacity
 	}
@@ -37,13 +42,42 @@ func New(capacity int) *Pool {
 		quit: make(chan struct{}),
 	}
 
+	for _, opt := range opts {
+		opt(p)
+	}
+	fmt.Printf("workerpool start(preAlloc=%t)\n", p.preAlloc)
+
+	if p.preAlloc {
+		for i := 0; i < capacity; i++ {
+			// create all goroutines and send into works channel
+			p.newWorker(i + 1)
+			p.active <- struct{}{}
+		}
+	}
+
 	go p.run()
 
 	return p
 }
 
 func (p *Pool) run() {
-	idx := 0
+	idx := len(p.active)
+	if !p.preAlloc {
+	loop:
+		for t := range p.tasks {
+			p.returnTask(t)
+			select {
+			case <-p.quit:
+				return
+			case p.active <- struct{}{}:
+				idx++
+				p.newWorker(idx)
+			default:
+				break loop
+			}
+		}
+	}
+
 	for {
 		select {
 		case <-p.quit:
@@ -85,7 +119,7 @@ func (p *Pool) newWorker(i int) {
 
 }
 
-var ErrWorkerPoolFreed = errors.New("worker pool freed") // worker pool 释放
+var ErrWorkerPoolFreed = errors.New("no idle worker in pool") // worker pool 释放
 
 func (p *Pool) Schedule(t Task) error {
 	select {
@@ -93,6 +127,13 @@ func (p *Pool) Schedule(t Task) error {
 		return ErrWorkerPoolFreed
 	case p.tasks <- t:
 		return nil
+	default:
+		if p.block {
+			p.tasks <- t
+			return nil
+		}
+		return ErrWorkerPoolFreed
+
 	}
 }
 
@@ -100,8 +141,14 @@ func (p * Pool) Free() {
 
 	// p.quit <- struct{}{} 我开始使用的是这个，
 	// 结果会死锁，我想大概是和java中的signal和signalAll的区别吧
-	//close(p.quit)
+	close(p.quit)
 
 	p.wg.Wait()
+
+	fmt.Printf("workerpool freed(preAlloc=%t)\n", p.preAlloc)
+}
+
+func (p *Pool) returnTask(task Task)  {
+
 }
 
